@@ -490,48 +490,108 @@ WlSessionLockSurface {
                             }
                         }
 
-                        // Text field
-                        TextField {
-                            id: passwordInput
+                        // Password display container
+                        FocusScope {
+                            id: passwordDisplayArea
                             Layout.fillWidth: true
+                            Layout.fillHeight: true
                             Layout.alignment: Qt.AlignVCenter
-                            placeholderText: usernameCollector.text.trim()
-                            placeholderTextColor: Qt.rgba(passwordFieldBg.item.r, passwordFieldBg.item.g, passwordFieldBg.item.b, 0.5)
-                            font.family: Config.theme.font
-                            font.pixelSize: Styling.fontSize(0)
-                            color: passwordFieldBg.item
-                            background: null
-                            echoMode: TextInput.Password
-                            verticalAlignment: TextInput.AlignVCenter
+
+                            property string passwordBuffer: ""
+
+                            clip: true
+
+                            // Focus scope handles keyboard input directly
+                            focus: true
                             enabled: !authenticating
 
-                            Behavior on color {
-                                enabled: Config.animDuration > 0
-                                ColorAnimation {
-                                    duration: Config.animDuration
-                                    easing.type: Easing.OutCubic
-                                }
-                            }
-
-                            Behavior on placeholderTextColor {
-                                enabled: Config.animDuration > 0
-                                ColorAnimation {
-                                    duration: Config.animDuration
-                                    easing.type: Easing.OutQuad
-                                }
-                            }
-
-                            onAccepted: {
-                                if (passwordInput.text.trim() === "")
+                            Keys.onPressed: (event) => {
+                                if (authenticating)
                                     return;
 
-                                // Guardar contraseña y limpiar campo inmediatamente
-                                authPasswordHolder.password = passwordInput.text;
-                                passwordInput.text = "";
+                                if (event.key === Qt.Key_Backspace) {
+                                    if (passwordBuffer.length > 0)
+                                        passwordBuffer = passwordBuffer.slice(0, -1);
+                                } else if (event.key === Qt.Key_Escape) {
+                                    passwordBuffer = "";
+                                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                    if (passwordBuffer.trim() === "")
+                                        return;
 
-                                authenticating = true;
-                                errorMessage = "";
-                                pamAuth.start();
+                                    authPasswordHolder.password = passwordBuffer;
+                                    passwordBuffer = "";
+
+                                    authenticating = true;
+                                    errorMessage = "";
+                                    pamAuth.start();
+                                } else if (event.text.length > 0
+                                           && !(event.modifiers & Qt.ControlModifier)
+                                           && event.text.charCodeAt(0) >= 0x20) {
+                                    passwordBuffer += event.text;
+                                }
+
+                                event.accepted = true;
+                            }
+
+                            Component.onCompleted: forceActiveFocus()
+
+                            // Placeholder text
+                            Text {
+                                id: placeholderText
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: usernameCollector.text.trim()
+                                font.family: Config.theme.font
+                                font.pixelSize: Styling.fontSize(0)
+                                color: Qt.rgba(passwordFieldBg.item.r, passwordFieldBg.item.g, passwordFieldBg.item.b, 0.5)
+                                visible: passwordDisplayArea.passwordBuffer.length === 0 && !authenticating
+                            }
+
+                            // Visual password display (shapes or dots)
+                            Row {
+                                id: passwordGlyphRow
+
+                                readonly property var shapeIcons: [
+                                    Icons.circle, Icons.cube, Icons.heart,
+                                    Icons.sparkle, Icons.shield, Icons.aperture,
+                                    Icons.seal, Icons.hand
+                                ]
+
+                                anchors.verticalCenter: parent.verticalCenter
+                                // Keep the newest glyphs visible once the row outgrows the field
+                                anchors.left: width <= parent.width ? parent.left : undefined
+                                anchors.right: width > parent.width ? parent.right : undefined
+                                spacing: 6
+                                visible: passwordDisplayArea.passwordBuffer.length > 0
+                                         && !authenticating
+                                         && Config.lockscreen.passwordStyle !== "hidden"
+
+                                Repeater {
+                                    model: passwordDisplayArea.passwordBuffer.length
+
+                                    Text {
+                                        required property int index
+
+                                        text: Config.lockscreen.passwordStyle === "shapes"
+                                            ? passwordGlyphRow.shapeIcons[index % passwordGlyphRow.shapeIcons.length]
+                                            : "●"
+                                        font.family: Config.lockscreen.passwordStyle === "shapes"
+                                            ? "Phosphor-Fill"
+                                            : Config.theme.font
+                                        font.pixelSize: Styling.fontSize(0)
+                                        color: passwordFieldBg.item
+                                        opacity: 0
+
+                                        Behavior on opacity {
+                                            enabled: Config.animDuration > 0
+                                            NumberAnimation {
+                                                duration: Config.animDuration
+                                                easing.type: Easing.OutCubic
+                                            }
+                                        }
+
+                                        Component.onCompleted: opacity = 1
+                                    }
+                                }
                             }
                         }
                     }
@@ -575,7 +635,7 @@ WlSessionLockSurface {
                 }
                 ScriptAction {
                     script: {
-                        passwordInput.text = "";
+                        passwordDisplayArea.passwordBuffer = "";
                         authenticating = false;
                         passwordInputBox.showError = false;
                     }
@@ -698,7 +758,7 @@ Timer {
                 if (Config.animDuration > 0) {
                     wrongPasswordAnim.start();
                 } else {
-                    passwordInput.text = "";
+                    passwordDisplayArea.passwordBuffer = "";
                     authenticating = false;
                     passwordInputBox.showError = false;
                 }
@@ -750,6 +810,6 @@ Timer {
 
         // Start animations
         startAnim = true;
-        passwordInput.forceActiveFocus();
+        passwordDisplayArea.forceActiveFocus();
     }
 }

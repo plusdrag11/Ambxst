@@ -10,6 +10,8 @@ Singleton {
     id: root
 
     property var wallpaperManager: null
+    // One-shot wallpaper transition override (consumed on the next wallpaper change)
+    property string wallpaperTransitionOverride: ""
     property string avatarCacheBuster: ""
 
     function pickUserAvatar() {

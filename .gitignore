@@ -7,3 +7,8 @@ result
 
 # Keep Go package sources visible when a global ignore file excludes pkg/.
 !/backend/pkg/
+keys.db
+clipboard.db
+clipboard-pinned.db
+clipboard-unpinned.db
+clipboard-data/

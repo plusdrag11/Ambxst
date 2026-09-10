@@ -4,6 +4,7 @@ import Quickshell.Wayland
 import Quickshell.Io
 import qs.modules.globals
 import qs.modules.theme
+import qs.modules.services
 import qs.config
 import "MpvShaderGenerator.js" as ShaderGenerator
 
@@ -39,6 +40,15 @@ PanelWindow {
     property string currentScreenName: wallpaper.screen ? wallpaper.screen.name : ""
     property alias tintEnabled: wallpaperAdapter.tintEnabled
     property int thumbnailsVersion: 0
+
+    // Autochange properties
+    property alias autochangeEnabled: wallpaperAdapter.autochangeEnabled
+    property alias autochangeInterval: wallpaperAdapter.autochangeInterval
+    property alias autochangeMode: wallpaperAdapter.autochangeMode
+    property alias autochangeApplyPalette: wallpaperAdapter.autochangeApplyPalette
+    property var _shuffledIndices: []
+    property int _shufflePosition: 0
+    property bool _autochangeTickInProgress: false
 
     // QUICKSHELL-GIT: property string mpvShaderDir: Quickshell.cacheDir + "/mpv_shaders_" + (currentScreenName ? currentScreenName : "ALL")
     property string mpvShaderDir: Quickshell.env("HOME") + "/.cache/ambxst/mpv_shaders_" + (currentScreenName ? currentScreenName : "ALL")
@@ -215,6 +225,12 @@ PanelWindow {
             return;
         }
 
+        // Autochange "picture only": skip per-change lockscreen frame regeneration.
+        if (_autochangeTickInProgress && !autochangeApplyPalette) {
+            console.log("Autochange palette updates disabled, skipping lockscreen frame");
+            return;
+        }
+
         console.log("Generating lockscreen frame for:", filePath);
 
         // QUICKSHELL-GIT: var dataPath = Quickshell.cacheDir;
@@ -239,7 +255,7 @@ PanelWindow {
         if (!wallpaperDir)
             return;
         // Explicitly update command with current wallpaperDir
-        var cmd = ["find", wallpaperDir, "-mindepth", "1", "-name", ".*", "-prune", "-o", "-type", "d", "-print"];
+        var cmd = ["find", "-L", wallpaperDir, "-mindepth", "1", "-name", ".*", "-prune", "-o", "-type", "d", "-print"];
         scanSubfoldersProcess.command = cmd;
         scanSubfoldersProcess.running = true;
     }
@@ -264,7 +280,7 @@ PanelWindow {
         directoryWatcher.path = wallpaperDir;
 
         // Force update scan command
-        var cmd = ["find", wallpaperDir, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"];
+        var cmd = ["find", "-L", wallpaperDir, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"];
         scanWallpapers.command = cmd;
         scanWallpapers.running = true;
 
@@ -277,9 +293,147 @@ PanelWindow {
             delayedThumbnailGen.start();
     }
 
-    onCurrentWallpaperChanged:
-    // Matugen se ejecuta manualmente en las funciones de cambio
-    {}
+    // --- IPC: wallpaper random/next/previous/set ---
+    IpcHandler {
+        target: "wallpaper"
+
+        function random(dir: string) {
+            if (dir && dir.trim().length > 0) {
+                // Scan the provided directory, then pick randomly
+                randomScanDir = dir.trim();
+                randomScanProcess.command = [
+                    "find", "-L", randomScanDir,
+                    "-name", ".*", "-prune", "-o",
+                    "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg",
+                    "-o", "-name", "*.png", "-o", "-name", "*.webp",
+                    "-o", "-name", "*.tif", "-o", "-name", "*.tiff",
+                    "-o", "-name", "*.gif", "-o", "-name", "*.mp4",
+                    "-o", "-name", "*.webm", "-o", "-name", "*.mov",
+                    "-o", "-name", "*.avi", "-o", "-name", "*.mkv",
+                    ")", "-print"
+                ];
+                randomScanProcess.running = true;
+            } else {
+                // No dir argument: pick from the default wallpaper list
+                if (wallpaperPaths.length === 0)
+                    return;
+                var pick = Math.floor(Math.random() * wallpaperPaths.length);
+                wallpaper.setWallpaper(wallpaperPaths[pick]);
+            }
+        }
+
+        function next() {
+            wallpaper.nextWallpaper();
+        }
+
+        function previous() {
+            wallpaper.previousWallpaper();
+        }
+
+        function set(path: string) {
+            wallpaper.setWallpaper(path);
+        }
+
+        function setTransition(path: string, transition: string) {
+            GlobalStates.wallpaperTransitionOverride = transition;
+            wallpaper.setWallpaper(path);
+            // Clear after the change has propagated through bindings
+            Qt.callLater(() => GlobalStates.wallpaperTransitionOverride = "");
+        }
+    }
+
+    // --- Autochange ---
+    function _initShuffle() {
+        _shuffledIndices = [];
+        for (var i = 0; i < wallpaperPaths.length; i++) {
+            _shuffledIndices.push(i);
+        }
+        // Fisher-Yates shuffle
+        for (var j = _shuffledIndices.length - 1; j > 0; j--) {
+            var k = Math.floor(Math.random() * (j + 1));
+            var tmp = _shuffledIndices[j];
+            _shuffledIndices[j] = _shuffledIndices[k];
+            _shuffledIndices[k] = tmp;
+        }
+        // Remove current index from front if present
+        if (_shuffledIndices.length > 1 && _shuffledIndices[0] === currentIndex) {
+            _shuffledIndices.shift();
+        }
+        _shufflePosition = 0;
+    }
+
+    function _autochangeTick() {
+        if (wallpaperPaths.length === 0)
+            return;
+        // Only the primary manager drives autochange; secondary screens follow via bindings.
+        if (GlobalStates.wallpaperManager !== wallpaper)
+            return;
+        if (GameModeClient.toggled || SuspendManager.isSuspending)
+            return;
+
+        _autochangeTickInProgress = true;
+        if (autochangeMode === "shuffle") {
+            if (_shufflePosition >= _shuffledIndices.length) {
+                _initShuffle();
+            }
+            if (_shuffledIndices.length > 0) {
+                setWallpaperByIndex(_shuffledIndices[_shufflePosition]);
+                _shufflePosition++;
+            }
+        } else {
+            nextWallpaper();
+        }
+        _autochangeTickInProgress = false;
+    }
+
+    Timer {
+        id: autochangeTimer
+        interval: Math.max(wallpaper.autochangeInterval, 300000)
+        repeat: true
+        running: wallpaper.autochangeEnabled && GlobalStates.wallpaperManager === wallpaper && wallpaper.initialLoadCompleted && wallpaperPaths.length > 1 && !GameModeClient.toggled && !SuspendManager.isSuspending && !(GlobalStates.dashboardOpen && GlobalStates.dashboardCurrentTab === 1)
+        onTriggered: wallpaper._autochangeTick()
+        onRunningChanged: {
+            if (running) {
+                if (autochangeMode === "shuffle")
+                    wallpaper._initShuffle();
+                restart();
+            }
+        }
+    }
+
+    onAutochangeModeChanged: {
+        if (autochangeEnabled && autochangeMode === "shuffle") {
+            _initShuffle();
+        }
+    }
+
+    onCurrentWallpaperChanged: {
+        // Reset timer on manual change so autochange doesn't interrupt
+        if (autochangeTimer.running) {
+            autochangeTimer.restart();
+        }
+    }
+
+    property string randomScanDir: ""
+
+    Process {
+        id: randomScanProcess
+        running: false
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var files = text.trim().split("\n").filter(function (f) {
+                    return f.length > 0;
+                });
+                if (files.length > 0) {
+                    var pick = Math.floor(Math.random() * files.length);
+                    console.log("Random wallpaper from", wallpaper.randomScanDir, ":", files[pick]);
+                    wallpaper.setWallpaper(files[pick]);
+                } else {
+                    console.warn("No wallpapers found in", wallpaper.randomScanDir);
+                }
+            }
+        }
+    }
 
     function setWallpaper(path, targetScreen = null) {
         if (GlobalStates.wallpaperManager && GlobalStates.wallpaperManager !== wallpaper) {
@@ -335,6 +489,15 @@ PanelWindow {
             delete perScreen[targetScreen];
             wallpaperConfig.adapter.perScreenWallpapers = perScreen;
         }
+    }
+
+    function setWallpaperDir(path) {
+        if (GlobalStates.wallpaperManager && GlobalStates.wallpaperManager !== wallpaper) {
+            GlobalStates.wallpaperManager.setWallpaperDir(path);
+            return;
+        }
+        console.log("Setting wallpaper directory to:", path);
+        wallpaperConfig.adapter.wallPath = path;
     }
 
     function nextWallpaper() {
@@ -401,6 +564,12 @@ PanelWindow {
     property string mpvSocket: "/tmp/ambxst_mpv_socket_" + (currentScreenName ? currentScreenName : "ALL")
 
     function runMatugenForCurrentWallpaper() {
+        // Autochange "picture only": keep the current palette, skip color extraction.
+        if (_autochangeTickInProgress && !autochangeApplyPalette) {
+            console.log("Autochange palette updates disabled, skipping Matugen");
+            return;
+        }
+
         if (activeColorPreset) {
             console.log("Skipping Matugen because color preset is active:", activeColorPreset);
             return;
@@ -418,9 +587,6 @@ PanelWindow {
             if (matugenProcessWithConfig.running) {
                 matugenProcessWithConfig.running = false;
             }
-            if (matugenProcessNormal.running) {
-                matugenProcessNormal.running = false;
-            }
 
             // Ejecutar matugen con configuración específica
             var commandWithConfig = ["matugen", "image", matugenSource, "--source-color-index", "0", "-c", decodeURIComponent(Qt.resolvedUrl("../../../../assets/matugen/config.toml").toString().replace("file://", "")), "-t", wallpaperConfig.adapter.matugenScheme];
@@ -429,14 +595,6 @@ PanelWindow {
             }
             matugenProcessWithConfig.command = commandWithConfig;
             matugenProcessWithConfig.running = true;
-
-            // Ejecutar matugen normal en paralelo
-            var commandNormal = ["matugen", "image", matugenSource, "--source-color-index", "0", "-t", wallpaperConfig.adapter.matugenScheme];
-            if (Config.theme.lightMode) {
-                commandNormal.push("-m", "light");
-            }
-            matugenProcessNormal.command = commandNormal;
-            matugenProcessNormal.running = true;
         }
     }
 
@@ -712,6 +870,11 @@ PanelWindow {
             if (!wallpaperConfig.adapter.matugenScheme) {
                 wallpaperConfig.adapter.matugenScheme = "scheme-tonal-spot";
             }
+            // Enforce a sane minimum autochange interval (5 minutes)
+            if (wallpaperConfig.adapter.autochangeInterval > 0 && wallpaperConfig.adapter.autochangeInterval < 300000) {
+                console.log("Autochange interval below minimum, clamping to 5 minutes");
+                wallpaperConfig.adapter.autochangeInterval = 300000;
+            }
             // Update the currentMatugenScheme property to trigger UI updates
             currentMatugenScheme = Qt.binding(function () {
                 return wallpaperConfig.adapter.matugenScheme;
@@ -727,6 +890,26 @@ PanelWindow {
             property string activeColorPreset: ""
             property bool tintEnabled: false
             property var perScreenWallpapers: ({})
+            property string transitionType: "random"
+            property int transitionDuration: 1000
+            property int transitionWaveCount: 3
+            property int transitionStripeCount: 0
+            property int transitionHoneycombSize: 1
+            property string transitionFillColor: "#000000"
+            property string transitionEasing: "inOutCubic"
+            property string transitionInterrupt: "freeze"
+            property string transitionInterruptReplay: "same"
+            property bool autochangeEnabled: false
+            property int autochangeInterval: 1800000
+            property string autochangeMode: "shuffle"
+            property bool autochangeApplyPalette: true
+            property bool videoAudio: false
+            property bool pauseAudioWhenOtherPlaying: false
+            property string fillMode: "cover"
+            property string advancePool: "all"
+            property bool videoPlayToEnd: false
+            property int videoSeekStepSeconds: 10
+            property var wallpaperDirs: []
 
             onActiveColorPresetChanged: {
                 if (wallpaperConfig.adapter.activeColorPreset !== wallpaper.activeColorPreset) {
@@ -772,7 +955,7 @@ PanelWindow {
                         directoryWatcher.reload();
 
                         // Perform initial wallpaper scan
-                        var cmd = ["find", wallPath, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"];
+                        var cmd = ["find", "-L", wallPath, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"];
                         scanWallpapers.command = cmd;
                         scanWallpapers.running = true;
                         wallpaper.scanSubfolders();
@@ -926,7 +1109,7 @@ PanelWindow {
     Process {
         id: scanSubfoldersProcess
         running: false
-        command: wallpaperDir ? ["find", wallpaperDir, "-mindepth", "1", "-name", ".*", "-prune", "-o", "-type", "d", "-print"] : []
+        command: wallpaperDir ? ["find", "-L", wallpaperDir, "-mindepth", "1", "-name", ".*", "-prune", "-o", "-type", "d", "-print"] : []
 
         stdout: StdioCollector {
             onStreamFinished: {
@@ -1046,7 +1229,7 @@ PanelWindow {
     Process {
         id: scanWallpapers
         running: false
-        command: wallpaperDir ? ["find", wallpaperDir, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"] : []
+        command: wallpaperDir ? ["find", "-L", wallpaperDir, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"] : []
 
         onRunningChanged: {
             if (running && wallpaperDir === "") {
@@ -1125,7 +1308,7 @@ PanelWindow {
     Process {
         id: scanFallback
         running: false
-        command: ["find", fallbackDir, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"]
+        command: ["find", "-L", fallbackDir, "-name", ".*", "-prune", "-o", "-type", "f", "(", "-name", "*.jpg", "-o", "-name", "*.jpeg", "-o", "-name", "*.png", "-o", "-name", "*.webp", "-o", "-name", "*.tif", "-o", "-name", "*.tiff", "-o", "-name", "*.gif", "-o", "-name", "*.mp4", "-o", "-name", "*.webm", "-o", "-name", "*.mov", "-o", "-name", "*.avi", "-o", "-name", "*.mkv", ")", "-print"]
 
         stdout: StdioCollector {
             onStreamFinished: {
@@ -1251,13 +1434,7 @@ PanelWindow {
             }
         }
 
-        // Trigger animation when source changes
         onSourceChanged: {
-            if (previousSource !== "" && source !== previousSource) {
-                if (Config.animDuration > 0) {
-                    transitionAnimation.restart();
-                }
-            }
             previousSource = source;
 
             // Kill mpvpaper if switching to a static image
@@ -1265,44 +1442,6 @@ PanelWindow {
                 var fileType = getFileType(source);
                 if (fileType === 'image') {
                     killMpvpaperProcess.running = true;
-                }
-            }
-        }
-
-        SequentialAnimation {
-            id: transitionAnimation
-
-            ParallelAnimation {
-                NumberAnimation {
-                    target: wallImage
-                    property: "scale"
-                    to: 1.01
-                    duration: Config.animDuration
-                    easing.type: Easing.OutCubic
-                }
-                NumberAnimation {
-                    target: wallImage
-                    property: "opacity"
-                    to: 0.5
-                    duration: Config.animDuration
-                    easing.type: Easing.OutCubic
-                }
-            }
-
-            ParallelAnimation {
-                NumberAnimation {
-                    target: wallImage
-                    property: "scale"
-                    to: 1.0
-                    duration: Config.animDuration
-                    easing.type: Easing.OutCubic
-                }
-                NumberAnimation {
-                    target: wallImage
-                    property: "opacity"
-                    to: 1.0
-                    duration: Config.animDuration
-                    easing.type: Easing.OutCubic
                 }
             }
         }
@@ -1327,69 +1466,25 @@ PanelWindow {
 
         Component {
             id: staticImageComponent
-            Item {
-                id: staticImageRoot
+            WallpaperTransition {
                 width: parent.width
                 height: parent.height
                 property string sourceFile: parent.sourceFile
-                property bool tint: wallpaper.tintEnabled
 
-                // Subset of colors for optimization (approx 25 colors vs 98)
-                readonly property var optimizedPalette: ["background", "overBackground", "shadow", "surface", "surfaceBright", "surfaceDim", "surfaceContainer", "surfaceContainerHigh", "surfaceContainerHighest", "surfaceContainerLow", "surfaceContainerLowest", "primary", "secondary", "tertiary", "red", "lightRed", "green", "lightGreen", "blue", "lightBlue", "yellow", "lightYellow", "cyan", "lightCyan", "magenta", "lightMagenta"]
-
-                // Palette generation for the shader
-                Item {
-                    id: paletteSourceItem
-                    // Must be visible for ShaderEffectSource to capture it,
-                    // but we hide it visually by placing it behind or expecting ShaderEffectSource hideSource behavior.
-                    visible: true
-                    width: staticImageRoot.optimizedPalette.length
-                    height: 1
-                    opacity: 0 // Make invisible to eye but maintain presence for capture if needed (though hideSource usually handles this)
-
-                    Row {
-                        anchors.fill: parent
-                        Repeater {
-                            model: staticImageRoot.optimizedPalette
-                            Rectangle {
-                                width: 1
-                                height: 1
-                                color: Colors[modelData]
-                            }
-                        }
-                    }
-                }
-
-                ShaderEffectSource {
-                    id: paletteTextureSource
-                    sourceItem: paletteSourceItem
-                    hideSource: true
-                    visible: false // The source object itself doesn't need to be visible in the scene graph
-                    smooth: false
-                    recursive: false
-                }
-
-                Image {
-                    mipmap: true
-                    id: rawImage
-                    anchors.fill: parent
-                    source: parent.sourceFile ? "file://" + parent.sourceFile : ""
-                    fillMode: Image.PreserveAspectCrop
-                    asynchronous: true
-                    smooth: true
-                    sourceSize.width: wallpaper.width
-                    sourceSize.height: wallpaper.height
-                    layer.enabled: parent.tint
-                    layer.effect: ShaderEffect {
-                        property var paletteTexture: paletteTextureSource
-                        property real paletteSize: staticImageRoot.optimizedPalette.length
-                        property real texWidth: rawImage.width
-                        property real texHeight: rawImage.height
-
-                        vertexShader: "palette.vert.qsb"
-                        fragmentShader: "palette.frag.qsb"
-                    }
-                }
+                source: sourceFile
+                tintEnabled: wallpaper.tintEnabled
+                targetWidth: wallpaper.width
+                targetHeight: wallpaper.height
+                transitionType: wallpaperConfig.adapter.transitionType
+                transitionDuration: wallpaperConfig.adapter.transitionDuration
+                waveCount: wallpaperConfig.adapter.transitionWaveCount
+                stripeCount: wallpaperConfig.adapter.transitionStripeCount
+                honeycombSize: wallpaperConfig.adapter.transitionHoneycombSize
+                fillColor: wallpaperConfig.adapter.transitionFillColor
+                transitionEasing: wallpaperConfig.adapter.transitionEasing
+                transitionInterrupt: wallpaperConfig.adapter.transitionInterrupt
+                transitionInterruptReplay: wallpaperConfig.adapter.transitionInterruptReplay
+                transitionOverride: GlobalStates.wallpaperTransitionOverride
             }
         }
 

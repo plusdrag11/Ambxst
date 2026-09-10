@@ -108,26 +108,38 @@ func (m *Manager) startDaemon() error {
 	return nil
 }
 
-// axctlSocketPath reproduces the path axctl itself uses for its IPC socket
-// (runtime dir first, legacy /tmp fallback — must stay in sync with axctl's
-// defaultSocketPath).
-func axctlSocketPath() string {
+// axctlSocketPaths returns every location axctl may place its IPC socket,
+// most-preferred first. axctl's own defaultSocketPath does not honour
+// XDG_RUNTIME_DIR — the daemon demonstrably binds /tmp/axctl-<uid>.sock even
+// with XDG_RUNTIME_DIR set — so the /tmp fallback must always be probed.
+// (Observed: backend waited on $XDG_RUNTIME_DIR/axctl.sock while the daemon
+// it had just spawned listened on /tmp/axctl-1000.sock, permanently
+// starving the compositor feed: bar showed no workspaces, launcher and
+// wallpaper IPC were dead.)
+func axctlSocketPaths() []string {
+	paths := []string{fmt.Sprintf("/tmp/axctl-%d.sock", os.Getuid())}
 	if runtime := os.Getenv("XDG_RUNTIME_DIR"); runtime != "" {
-		return filepath.Join(runtime, "axctl.sock")
+		p := filepath.Join(runtime, "axctl.sock")
+		if p != paths[0] {
+			paths = append([]string{p}, paths...)
+		}
 	}
-	return fmt.Sprintf("/tmp/axctl-%d.sock", os.Getuid())
+	return paths
 }
 
-// waitForSocket blocks until the axctl socket exists or the timeout elapses.
-func waitForSocket(path string, timeout time.Duration) error {
+// waitForSockets blocks until any of the candidate paths is a socket, and
+// reports which one appeared. It returns an error only after timeout.
+func waitForSockets(paths []string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
-			return nil
+		for _, path := range paths {
+			if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+				return path, nil
+			}
 		}
 		time.Sleep(socketWaitStep)
 	}
-	return fmt.Errorf("axctl socket %s did not appear", path)
+	return "", fmt.Errorf("axctl socket did not appear (tried %s)", strings.Join(paths, ", "))
 }
 
 // subscribeLoop keeps an axctl subscribe process alive. It waits for the
@@ -142,9 +154,14 @@ func (m *Manager) subscribeLoop() {
 		default:
 		}
 
-		if err := waitForSocket(axctlSocketPath(), socketWaitTimeout); err != nil {
-			fmt.Fprintf(os.Stderr, "[compositor] %v\n", err)
-			return
+		if _, err := waitForSockets(axctlSocketPaths(), socketWaitTimeout); err != nil {
+			fmt.Fprintf(os.Stderr, "[compositor] %v; retrying\n", err)
+			select {
+			case <-m.stopCh:
+				return
+			case <-time.After(subscribeRetryDelay):
+			}
+			continue
 		}
 
 		cmd := exec.Command("axctl", "subscribe")

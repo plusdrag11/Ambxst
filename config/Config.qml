@@ -924,6 +924,7 @@ Singleton {
 
         adapter: JsonAdapter {
             property string position: "bottom"
+            property string passwordStyle: "dots"
         }
     }
 
